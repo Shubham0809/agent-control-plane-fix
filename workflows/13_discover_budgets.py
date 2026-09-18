@@ -221,7 +221,11 @@ def _to_row(b: Dict[str, Any]) -> Dict[str, Any]:
 
 # COMMAND ----------
 
-_COST = "ROUND(SUM(u.usage_quantity * COALESCE(lp.pricing.effective_list.default, lp.pricing.default, 0)), 2)"
+# List price = COALESCE(effective_list.default, default) with NO hardcoded
+# fallback, matching 09/03. An unpriced SKU yields NULL (excluded from the SUM)
+# instead of a silent $0, so budget consumption uses the same real list-price
+# math as Cost Overview rather than a divergent fallback.
+_COST = "ROUND(SUM(u.usage_quantity * COALESCE(lp.pricing.effective_list.default, lp.pricing.default)), 2)"
 _FROM = """FROM system.billing.usage u
   LEFT JOIN system.billing.list_prices lp
     ON u.sku_name = lp.sku_name AND u.cloud = lp.cloud AND u.usage_unit = lp.usage_unit AND lp.price_end_time IS NULL

@@ -262,6 +262,18 @@ def _execute_sql(sql: str) -> List[Dict[str, Any]]:
 
 now = datetime.now(timezone.utc)
 
+# ── Pricing rule (applied identically in every cost query in this file and in
+#    03_discover_knowledge_bases.py / 13_discover_budgets.py) ──────────────────
+#    list price = COALESCE(lp.pricing.effective_list.default, lp.pricing.default)
+#    from system.billing.list_prices — the real SKU catalog, no invented rate.
+#
+#    VALUE: previously these joins fell back to a hardcoded $0.07/DBU here (and a
+#    silent $0 in the product/tag/budget queries) when a SKU was missing from
+#    list_prices. Same usage could therefore show cost = DBU × $0.07 on one page
+#    and $0 on another, so Cost Overview, per-user $, KB billing and budget
+#    consumption disagreed. Dropping the fallback makes an unpriced SKU yield
+#    NULL, which SUM() excludes from total_cost_usd while total_dbus still counts
+#    the usage — one consistent, non-fabricated number across every view.
 print(f"▸ Querying system.billing.usage for model-serving costs ({RETENTION_DAYS} days) …")
 serving_rows = _execute_sql(f"""
     SELECT
@@ -271,7 +283,7 @@ serving_rows = _execute_sql(f"""
         u.sku_name,
         ROUND(SUM(u.usage_quantity), 4)             AS total_dbus,
         ROUND(SUM(u.usage_quantity *
-            COALESCE(lp.pricing.effective_list.default, lp.pricing.default, 0.07)
+            COALESCE(lp.pricing.effective_list.default, lp.pricing.default)
         ), 4)                                        AS total_cost_usd
     FROM system.billing.usage u
     LEFT JOIN system.billing.list_prices lp
@@ -329,7 +341,7 @@ product_rows = _execute_sql(f"""
         u.billing_origin_product,
         ROUND(SUM(u.usage_quantity), 4)             AS total_dbus,
         ROUND(SUM(u.usage_quantity *
-            COALESCE(lp.pricing.effective_list.default, lp.pricing.default, 0)
+            COALESCE(lp.pricing.effective_list.default, lp.pricing.default)
         ), 4)                                        AS total_cost_usd
     FROM system.billing.usage u
     LEFT JOIN system.billing.list_prices lp
@@ -398,7 +410,7 @@ try:
             COALESCE(u.identity_metadata.run_by, 'unknown')    AS run_by,
             ROUND(SUM(u.usage_quantity), 4)                    AS total_dbus,
             ROUND(SUM(u.usage_quantity *
-                COALESCE(lp.pricing.effective_list.default, lp.pricing.default, 0.07)
+                COALESCE(lp.pricing.effective_list.default, lp.pricing.default)
             ), 4)                                              AS total_cost_usd
         FROM system.billing.usage u
         LEFT JOIN system.billing.list_prices lp
@@ -506,7 +518,7 @@ print(f"▸ Querying system.billing.usage for cost-by-tag ({RETENTION_DAYS} days
 tag_cost_rows = _execute_sql(f"""
     WITH priced AS (
         SELECT u.custom_tags,
-               u.usage_quantity * COALESCE(lp.pricing.effective_list.default, lp.pricing.default, 0) AS usd
+               u.usage_quantity * COALESCE(lp.pricing.effective_list.default, lp.pricing.default) AS usd
         FROM system.billing.usage u
         LEFT JOIN system.billing.list_prices lp
             ON u.sku_name = lp.sku_name AND u.cloud = lp.cloud
