@@ -27,7 +27,7 @@
 import json
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from databricks.sdk import WorkspaceClient
 from pyspark.sql import SparkSession
@@ -226,31 +226,51 @@ def _execute_sql(sql: str) -> List[Dict[str, Any]]:
     import urllib.request as _ureq
     rows: List[Dict[str, Any]] = []
 
-    def _download_chunk_links(chunk_obj: dict, chunk_label: str):
+    def _download_chunk_links(chunk_obj: dict, chunk_label: str) -> None:
         for link in chunk_obj.get("external_links") or []:
             url = link.get("external_link") or ""
             if not url:
                 continue
-            try:
-                with _ureq.urlopen(url, timeout=60) as r:
-                    data = _json.loads(r.read())
-                for row in data:
-                    rows.append(dict(zip(cols, row)))
-            except Exception as exc:
-                print(f"  ⚠️  {chunk_label} download failed: {exc}")
+            last_exc: Optional[Exception] = None
+            for attempt in range(2):
+                try:
+                    with _ureq.urlopen(url, timeout=60) as r:
+                        data = _json.loads(r.read())
+                    for row in data:
+                        rows.append(dict(zip(cols, row)))
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    print(f"  ⚠️  {chunk_label} download failed (attempt {attempt + 1}/2): {exc}")
+            if last_exc is not None:
+                raise RuntimeError(f"{chunk_label} download failed: {last_exc}") from last_exc
 
     # Chunk 0's link is in the initial result. Re-use it.
     _download_chunk_links(resp.get("result") or {}, "chunk 0")
 
     # Chunks 1..N-1 must be fetched explicitly by index.
     for i in range(1, total_chunks):
-        try:
-            chunk = w.api_client.do("GET", f"/api/2.0/sql/statements/{sid}/result/chunks/{i}")
-            _download_chunk_links(chunk, f"chunk {i}")
-        except Exception as exc:
-            print(f"  ⚠️  chunk {i} fetch failed: {exc}")
+        last_exc: Optional[Exception] = None
+        chunk = None
+        for attempt in range(2):
+            try:
+                chunk = w.api_client.do("GET", f"/api/2.0/sql/statements/{sid}/result/chunks/{i}")
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                print(f"  ⚠️  chunk {i} fetch failed (attempt {attempt + 1}/2): {exc}")
+        if last_exc is not None:
+            raise RuntimeError(f"chunk {i} fetch failed: {last_exc}") from last_exc
+        _download_chunk_links(chunk, f"chunk {i}")
 
     print(f"  collected {len(rows)}/{total_rows} rows")
+    if total_rows and len(rows) != total_rows:
+        raise RuntimeError(
+            f"Incomplete billing download: collected {len(rows)}/{total_rows} rows; "
+            "refusing to overwrite Delta with a partial result"
+        )
     return rows
 
 # COMMAND ----------

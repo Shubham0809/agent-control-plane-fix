@@ -290,14 +290,15 @@ try:
         except Exception as e:
             print(f"  Could not list indexes: {e}")
 
-        # Truncate and reload for a clean snapshot (matches the app's refresh_discovery behavior)
-        cur.execute("TRUNCATE TABLE discovered_agents")
-        conn.commit()
-        print("Truncated existing Lakebase discovered_agents")
+        # Truncate + insert in ONE transaction (do not commit the truncate first):
+        # a failed insert must roll back rather than leave discovered_agents empty.
+        try:
+            cur.execute("TRUNCATE TABLE discovered_agents")
+            print("Truncated existing Lakebase discovered_agents")
 
-        # Bulk insert using execute_values with ON CONFLICT to handle
-        # duplicate (name, workspace_id) pairs from different discovery sources
-        insert_sql = """
+            # Bulk insert using execute_values with ON CONFLICT to handle
+            # duplicate (name, workspace_id) pairs from different discovery sources
+            insert_sql = """
             INSERT INTO discovered_agents
                 (agent_id, workspace_id, name, type, endpoint_name,
                  endpoint_status, model_name, served_entity_name,
@@ -328,59 +329,62 @@ try:
                 classified_by = EXCLUDED.classified_by,
                 classifier_version = EXCLUDED.classifier_version,
                 raw_signals = EXCLUDED.raw_signals
-        """
+            """
 
-        # Migration-safe field access (classification columns may be absent if an
-        # older Delta snapshot is read before 01 re-runs).
-        def _rg(row, field):
-            try:
-                return row[field]
-            except Exception:
-                return None
-
-        values = []
-        now = datetime.now(timezone.utc)
-        for r in rows:
-            config_val = r.config
-            # Ensure config is valid JSON for JSONB column
-            if config_val:
+            # Migration-safe field access (classification columns may be absent if an
+            # older Delta snapshot is read before 01 re-runs).
+            def _rg(row, field):
                 try:
-                    json.loads(config_val)
-                except (json.JSONDecodeError, TypeError):
+                    return row[field]
+                except Exception:
+                    return None
+
+            values = []
+            now = datetime.now(timezone.utc)
+            for r in rows:
+                config_val = r.config
+                # Ensure config is valid JSON for JSONB column
+                if config_val:
+                    try:
+                        json.loads(config_val)
+                    except (json.JSONDecodeError, TypeError):
+                        config_val = json.dumps({})
+                else:
                     config_val = json.dumps({})
-            else:
-                config_val = json.dumps({})
 
-            uses_llm = _rg(r, "uses_llm")
-            values.append((
-                r.agent_id,
-                r.workspace_id,
-                r.name,
-                r.type,
-                r.endpoint_name or "",
-                r.endpoint_status or "",
-                r.model_name or "",
-                r.served_entity_name or "",
-                r.creator or "",
-                r.description or "",
-                config_val,
-                now,
-                r.source or "api",
-                bool(r.is_extensive),
-                _rg(r, "workload_class"),
-                _rg(r, "subtype"),
-                _rg(r, "framework"),
-                _rg(r, "interface_task"),
-                (None if uses_llm is None else bool(uses_llm)),
-                _rg(r, "linked_endpoint"),
-                _rg(r, "confidence"),
-                _rg(r, "classified_by"),
-                _rg(r, "classifier_version"),
-                _rg(r, "raw_signals"),
-            ))
+                uses_llm = _rg(r, "uses_llm")
+                values.append((
+                    r.agent_id,
+                    r.workspace_id,
+                    r.name,
+                    r.type,
+                    r.endpoint_name or "",
+                    r.endpoint_status or "",
+                    r.model_name or "",
+                    r.served_entity_name or "",
+                    r.creator or "",
+                    r.description or "",
+                    config_val,
+                    now,
+                    r.source or "api",
+                    bool(r.is_extensive),
+                    _rg(r, "workload_class"),
+                    _rg(r, "subtype"),
+                    _rg(r, "framework"),
+                    _rg(r, "interface_task"),
+                    (None if uses_llm is None else bool(uses_llm)),
+                    _rg(r, "linked_endpoint"),
+                    _rg(r, "confidence"),
+                    _rg(r, "classified_by"),
+                    _rg(r, "classifier_version"),
+                    _rg(r, "raw_signals"),
+                ))
 
-        execute_values(cur, insert_sql, values, page_size=100)
-        conn.commit()
+            execute_values(cur, insert_sql, values, page_size=100)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
         # Verify
         cur.execute("SELECT COUNT(*) FROM discovered_agents")
@@ -2415,232 +2419,156 @@ def _stamp_cache_meta(conn, cache_key: str, rows_loaded: int) -> None:
         print(f"  ⚠️  cache_meta update failed for {cache_key}: {exc}")
 
 
+def _sync_billing_full_refresh(conn, pg_table, delta_table, insert_sql, row_to_tuple, cache_key, label):
+    """Read Delta first, then TRUNCATE + INSERT in one transaction.
+
+    Committing TRUNCATE before collect()/insert used to leave the Lakebase
+    table empty (and stamp cache_meta as fresh) when the insert side failed.
+    ``pg_table`` is a hardcoded identifier, never user input.
+    """
+    count = 0
+    try:
+        conn.rollback()  # clear any aborted transaction from a prior block
+        delta_rows = spark.read.table(delta_table).collect()
+        values = [row_to_tuple(r) for r in delta_rows]
+        count = len(values)
+        with conn.cursor() as cur:
+            cur.execute(f"TRUNCATE TABLE {pg_table}")
+            if values:
+                execute_values(cur, insert_sql, values, page_size=500)
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"  ⚠️  {pg_table} sync failed: {exc}")
+        return 0
+    print(f"  ✅ {count} {label} synced")
+    _stamp_cache_meta(conn, cache_key, count)
+    return count
+
+
 # Sync billing_serving_daily
 print(f"▸ Syncing {BSD_TABLE} → billing_serving_daily ...")
-try:
-    with billing_conn.cursor() as cur:
-        cur.execute("TRUNCATE TABLE billing_serving_daily")
-        billing_conn.commit()
-    bsd_rows = spark.read.table(BSD_TABLE).collect()
-    if bsd_rows:
-        values = [(r.usage_date, r.workspace_id, r.endpoint_name, r.sku_name or "",
-                   float(r.total_dbus or 0), float(r.total_cost_usd or 0))
-                  for r in bsd_rows]
-        bsd_count = len(values)
-        with billing_conn.cursor() as cur:
-            execute_values(cur,
-                """INSERT INTO billing_serving_daily
-                   (usage_date, workspace_id, endpoint_name, sku_name, total_dbus, total_cost_usd, last_synced)
-                   VALUES %s
-                   ON CONFLICT (usage_date, workspace_id, endpoint_name, sku_name) DO UPDATE SET
-                       total_dbus = EXCLUDED.total_dbus,
-                       total_cost_usd = EXCLUDED.total_cost_usd,
-                       last_synced = NOW()""",
-                [(v[0], v[1], v[2], v[3], v[4], v[5], now) for v in values],
-                page_size=500)
-            billing_conn.commit()
-    print(f"  ✅ {bsd_count} serving-cost rows synced")
-    _stamp_cache_meta(billing_conn, "serving_daily", bsd_count)
-except Exception as exc:
-    print(f"  ⚠️  billing_serving_daily sync failed: {exc}")
+bsd_count = _sync_billing_full_refresh(
+    billing_conn, "billing_serving_daily", BSD_TABLE,
+    """INSERT INTO billing_serving_daily
+       (usage_date, workspace_id, endpoint_name, sku_name, total_dbus, total_cost_usd, last_synced)
+       VALUES %s
+       ON CONFLICT (usage_date, workspace_id, endpoint_name, sku_name) DO UPDATE SET
+           total_dbus = EXCLUDED.total_dbus,
+           total_cost_usd = EXCLUDED.total_cost_usd,
+           last_synced = NOW()""",
+    lambda r: (r.usage_date, r.workspace_id, r.endpoint_name, r.sku_name or "",
+               float(r.total_dbus or 0), float(r.total_cost_usd or 0), now),
+    "serving_daily", "serving-cost rows",
+)
 
 # Sync billing_token_daily
 print(f"▸ Syncing {BTD_TABLE} → billing_token_daily ...")
-try:
-    with billing_conn.cursor() as cur:
-        cur.execute("TRUNCATE TABLE billing_token_daily")
-        billing_conn.commit()
-    btd_rows = spark.read.table(BTD_TABLE).collect()
-    if btd_rows:
-        values = [(r.usage_date, r.workspace_id, r.endpoint_name,
-                   int(r.request_count or 0),
-                   int(r.input_tokens or 0), int(r.output_tokens or 0),
-                   float(r.avg_input_tokens or 0), float(r.avg_output_tokens or 0))
-                  for r in btd_rows]
-        btd_count = len(values)
-        with billing_conn.cursor() as cur:
-            execute_values(cur,
-                """INSERT INTO billing_token_daily
-                   (usage_date, workspace_id, endpoint_name, request_count,
-                    input_tokens, output_tokens, avg_input_tokens, avg_output_tokens, last_synced)
-                   VALUES %s
-                   ON CONFLICT (usage_date, workspace_id, endpoint_name) DO UPDATE SET
-                       request_count = EXCLUDED.request_count,
-                       input_tokens = EXCLUDED.input_tokens,
-                       output_tokens = EXCLUDED.output_tokens,
-                       avg_input_tokens = EXCLUDED.avg_input_tokens,
-                       avg_output_tokens = EXCLUDED.avg_output_tokens,
-                       last_synced = NOW()""",
-                [(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], now) for v in values],
-                page_size=500)
-            billing_conn.commit()
-    print(f"  ✅ {btd_count} token-usage rows synced")
-    _stamp_cache_meta(billing_conn, "token_daily", btd_count)
-except Exception as exc:
-    print(f"  ⚠️  billing_token_daily sync failed: {exc}")
+btd_count = _sync_billing_full_refresh(
+    billing_conn, "billing_token_daily", BTD_TABLE,
+    """INSERT INTO billing_token_daily
+       (usage_date, workspace_id, endpoint_name, request_count,
+        input_tokens, output_tokens, avg_input_tokens, avg_output_tokens, last_synced)
+       VALUES %s
+       ON CONFLICT (usage_date, workspace_id, endpoint_name) DO UPDATE SET
+           request_count = EXCLUDED.request_count,
+           input_tokens = EXCLUDED.input_tokens,
+           output_tokens = EXCLUDED.output_tokens,
+           avg_input_tokens = EXCLUDED.avg_input_tokens,
+           avg_output_tokens = EXCLUDED.avg_output_tokens,
+           last_synced = NOW()""",
+    lambda r: (r.usage_date, r.workspace_id, r.endpoint_name,
+               int(r.request_count or 0),
+               int(r.input_tokens or 0), int(r.output_tokens or 0),
+               float(r.avg_input_tokens or 0), float(r.avg_output_tokens or 0), now),
+    "token_daily", "token-usage rows",
+)
 
 # Sync billing_product_daily
 print(f"▸ Syncing {BPD_TABLE} → billing_product_daily ...")
-try:
-    with billing_conn.cursor() as cur:
-        cur.execute("TRUNCATE TABLE billing_product_daily")
-        billing_conn.commit()
-    bpd_rows = spark.read.table(BPD_TABLE).collect()
-    if bpd_rows:
-        values = [(r.usage_date, r.workspace_id, r.billing_origin_product,
-                   float(r.total_dbus or 0), float(r.total_cost_usd or 0))
-                  for r in bpd_rows]
-        bpd_count = len(values)
-        with billing_conn.cursor() as cur:
-            execute_values(cur,
-                """INSERT INTO billing_product_daily
-                   (usage_date, workspace_id, billing_origin_product, total_dbus, total_cost_usd, last_synced)
-                   VALUES %s
-                   ON CONFLICT (usage_date, workspace_id, billing_origin_product) DO UPDATE SET
-                       total_dbus = EXCLUDED.total_dbus,
-                       total_cost_usd = EXCLUDED.total_cost_usd,
-                       last_synced = NOW()""",
-                [(v[0], v[1], v[2], v[3], v[4], now) for v in values],
-                page_size=500)
-            billing_conn.commit()
-    print(f"  ✅ {bpd_count} product-cost rows synced")
-    _stamp_cache_meta(billing_conn, "product_daily", bpd_count)
-except Exception as exc:
-    print(f"  ⚠️  billing_product_daily sync failed: {exc}")
+bpd_count = _sync_billing_full_refresh(
+    billing_conn, "billing_product_daily", BPD_TABLE,
+    """INSERT INTO billing_product_daily
+       (usage_date, workspace_id, billing_origin_product, total_dbus, total_cost_usd, last_synced)
+       VALUES %s
+       ON CONFLICT (usage_date, workspace_id, billing_origin_product) DO UPDATE SET
+           total_dbus = EXCLUDED.total_dbus,
+           total_cost_usd = EXCLUDED.total_cost_usd,
+           last_synced = NOW()""",
+    lambda r: (r.usage_date, r.workspace_id, r.billing_origin_product,
+               float(r.total_dbus or 0), float(r.total_cost_usd or 0), now),
+    "product_daily", "product-cost rows",
+)
 
 # Sync billing_user_endpoint_daily
 print(f"▸ Syncing {BUED_TABLE} → billing_user_endpoint_daily ...")
-try:
-    with billing_conn.cursor() as cur:
-        cur.execute("TRUNCATE TABLE billing_user_endpoint_daily")
-        billing_conn.commit()
-    bued_rows = spark.read.table(BUED_TABLE).collect()
-    if bued_rows:
-        values = [(r.usage_date, r.workspace_id, r.endpoint_name,
-                   r.user_identity or "unknown",
-                   int(r.request_count or 0),
-                   int(r.input_tokens or 0), int(r.output_tokens or 0))
-                  for r in bued_rows]
-        bued_count = len(values)
-        with billing_conn.cursor() as cur:
-            execute_values(cur,
-                """INSERT INTO billing_user_endpoint_daily
-                   (usage_date, workspace_id, endpoint_name, user_identity,
-                    request_count, input_tokens, output_tokens, last_synced)
-                   VALUES %s
-                   ON CONFLICT (usage_date, workspace_id, endpoint_name, user_identity) DO UPDATE SET
-                       request_count = EXCLUDED.request_count,
-                       input_tokens = EXCLUDED.input_tokens,
-                       output_tokens = EXCLUDED.output_tokens,
-                       last_synced = NOW()""",
-                [(v[0], v[1], v[2], v[3], v[4], v[5], v[6], now) for v in values],
-                page_size=500)
-            billing_conn.commit()
-    print(f"  ✅ {bued_count} user-endpoint rows synced")
-    _stamp_cache_meta(billing_conn, "user_endpoint_daily", bued_count)
-except Exception as exc:
-    print(f"  ⚠️  billing_user_endpoint_daily sync failed: {exc}")
+bued_count = _sync_billing_full_refresh(
+    billing_conn, "billing_user_endpoint_daily", BUED_TABLE,
+    """INSERT INTO billing_user_endpoint_daily
+       (usage_date, workspace_id, endpoint_name, user_identity,
+        request_count, input_tokens, output_tokens, last_synced)
+       VALUES %s
+       ON CONFLICT (usage_date, workspace_id, endpoint_name, user_identity) DO UPDATE SET
+           request_count = EXCLUDED.request_count,
+           input_tokens = EXCLUDED.input_tokens,
+           output_tokens = EXCLUDED.output_tokens,
+           last_synced = NOW()""",
+    lambda r: (r.usage_date, r.workspace_id, r.endpoint_name,
+               r.user_identity or "unknown",
+               int(r.request_count or 0),
+               int(r.input_tokens or 0), int(r.output_tokens or 0), now),
+    "user_endpoint_daily", "user-endpoint rows",
+)
 
 # Sync billing_user_cost_daily (actual per-user $ — UAG v2 attribution)
 print(f"▸ Syncing {BUCD_TABLE} → billing_user_cost_daily ...")
-try:
-    with billing_conn.cursor() as cur:
-        cur.execute("TRUNCATE TABLE billing_user_cost_daily")
-        billing_conn.commit()
-    bucd_rows = spark.read.table(BUCD_TABLE).collect()
-    if bucd_rows:
-        values = [(r.usage_date, r.workspace_id, r.endpoint_id or "", r.endpoint_name or "",
-                   r.run_by or "unknown",
-                   float(r.total_dbus or 0), float(r.total_cost_usd or 0))
-                  for r in bucd_rows]
-        bucd_count = len(values)
-        with billing_conn.cursor() as cur:
-            execute_values(cur,
-                """INSERT INTO billing_user_cost_daily
-                   (usage_date, workspace_id, endpoint_id, endpoint_name, run_by,
-                    total_dbus, total_cost_usd, last_synced)
-                   VALUES %s
-                   ON CONFLICT (usage_date, workspace_id, endpoint_id, run_by) DO UPDATE SET
-                       endpoint_name = EXCLUDED.endpoint_name,
-                       total_dbus = EXCLUDED.total_dbus,
-                       total_cost_usd = EXCLUDED.total_cost_usd,
-                       last_synced = NOW()""",
-                [(v[0], v[1], v[2], v[3], v[4], v[5], v[6], now) for v in values],
-                page_size=500)
-            billing_conn.commit()
-    print(f"  ✅ {bucd_count} user-cost rows synced")
-    _stamp_cache_meta(billing_conn, "user_cost_daily", bucd_count)
-except Exception as exc:
-    # Rollback so a failed INSERT here (e.g. billing_user_cost_daily is app-owned
-    # and may be missing last_synced) does not leave the shared connection in an
-    # aborted-transaction state that poisons the next sync block below.
-    billing_conn.rollback()
-    print(f"  ⚠️  billing_user_cost_daily sync failed: {exc}")
+bucd_count = _sync_billing_full_refresh(
+    billing_conn, "billing_user_cost_daily", BUCD_TABLE,
+    """INSERT INTO billing_user_cost_daily
+       (usage_date, workspace_id, endpoint_id, endpoint_name, run_by,
+        total_dbus, total_cost_usd, last_synced)
+       VALUES %s
+       ON CONFLICT (usage_date, workspace_id, endpoint_id, run_by) DO UPDATE SET
+           endpoint_name = EXCLUDED.endpoint_name,
+           total_dbus = EXCLUDED.total_dbus,
+           total_cost_usd = EXCLUDED.total_cost_usd,
+           last_synced = NOW()""",
+    lambda r: (r.usage_date, r.workspace_id, r.endpoint_id or "", r.endpoint_name or "",
+               r.run_by or "unknown",
+               float(r.total_dbus or 0), float(r.total_cost_usd or 0), now),
+    "user_cost_daily", "user-cost rows",
+)
 
 # Sync billing_cost_by_tag (MODEL_SERVING $ attributed by custom_tag — window aggregate)
 print(f"▸ Syncing {BTAG_TABLE} → billing_cost_by_tag ...")
-try:
-    # Defense-in-depth: clear any aborted transaction inherited from a prior
-    # block so this block's TRUNCATE isn't rejected with "transaction is aborted".
-    billing_conn.rollback()
-    with billing_conn.cursor() as cur:
-        cur.execute("TRUNCATE TABLE billing_cost_by_tag")
-        billing_conn.commit()
-    btag_rows = spark.read.table(BTAG_TABLE).collect()
-    if btag_rows:
-        values = [(r.tag_key or "", r.tag_value or "", float(r.total_cost_usd or 0))
-                  for r in btag_rows]
-        btag_count = len(values)
-        with billing_conn.cursor() as cur:
-            execute_values(cur,
-                """INSERT INTO billing_cost_by_tag
-                   (tag_key, tag_value, total_cost_usd, last_synced)
-                   VALUES %s
-                   ON CONFLICT (tag_key, tag_value) DO UPDATE SET
-                       total_cost_usd = EXCLUDED.total_cost_usd,
-                       last_synced = NOW()""",
-                [(v[0], v[1], v[2], now) for v in values],
-                page_size=500)
-            billing_conn.commit()
-    print(f"  ✅ {btag_count} cost-by-tag rows synced")
-    _stamp_cache_meta(billing_conn, "cost_by_tag", btag_count)
-except Exception as exc:
-    # Clear any aborted transaction so a future sync block appended after this
-    # one doesn't inherit a poisoned connection (see the uag_conn rollback guards).
-    billing_conn.rollback()
-    print(f"  ⚠️  billing_cost_by_tag sync failed: {exc}")
+btag_count = _sync_billing_full_refresh(
+    billing_conn, "billing_cost_by_tag", BTAG_TABLE,
+    """INSERT INTO billing_cost_by_tag
+       (tag_key, tag_value, total_cost_usd, last_synced)
+       VALUES %s
+       ON CONFLICT (tag_key, tag_value) DO UPDATE SET
+           total_cost_usd = EXCLUDED.total_cost_usd,
+           last_synced = NOW()""",
+    lambda r: (r.tag_key or "", r.tag_value or "", float(r.total_cost_usd or 0), now),
+    "cost_by_tag", "cost-by-tag rows",
+)
 
 # Sync billing_external_model_spend (external LLM $ via AI Gateway — window aggregate)
 print(f"▸ Syncing {BEXT_TABLE} → billing_external_model_spend ...")
-try:
-    billing_conn.rollback()  # start clean regardless of any prior block's state
-    with billing_conn.cursor() as cur:
-        cur.execute("TRUNCATE TABLE billing_external_model_spend")
-        billing_conn.commit()
-    bext_rows = spark.read.table(BEXT_TABLE).collect()
-    if bext_rows:
-        values = [(r.provider or "", r.model or "", r.endpoint_name or "",
-                   int(r.call_count or 0), float(r.total_cost_usd or 0), r.last_seen)
-                  for r in bext_rows]
-        bext_count = len(values)
-        with billing_conn.cursor() as cur:
-            execute_values(cur,
-                """INSERT INTO billing_external_model_spend
-                   (provider, model, endpoint_name, call_count, total_cost_usd, last_seen, last_synced)
-                   VALUES %s
-                   ON CONFLICT (provider, model, endpoint_name) DO UPDATE SET
-                       call_count = EXCLUDED.call_count,
-                       total_cost_usd = EXCLUDED.total_cost_usd,
-                       last_seen = EXCLUDED.last_seen,
-                       last_synced = NOW()""",
-                [(v[0], v[1], v[2], v[3], v[4], v[5], now) for v in values],
-                page_size=500)
-            billing_conn.commit()
-    print(f"  ✅ {bext_count} external-model-spend rows synced")
-    _stamp_cache_meta(billing_conn, "external_model_spend", bext_count)
-except Exception as exc:
-    billing_conn.rollback()
-    print(f"  ⚠️  billing_external_model_spend sync failed: {exc}")
+bext_count = _sync_billing_full_refresh(
+    billing_conn, "billing_external_model_spend", BEXT_TABLE,
+    """INSERT INTO billing_external_model_spend
+       (provider, model, endpoint_name, call_count, total_cost_usd, last_seen, last_synced)
+       VALUES %s
+       ON CONFLICT (provider, model, endpoint_name) DO UPDATE SET
+           call_count = EXCLUDED.call_count,
+           total_cost_usd = EXCLUDED.total_cost_usd,
+           last_seen = EXCLUDED.last_seen,
+           last_synced = NOW()""",
+    lambda r: (r.provider or "", r.model or "", r.endpoint_name or "",
+               int(r.call_count or 0), float(r.total_cost_usd or 0), r.last_seen, now),
+    "external_model_spend", "external-model-spend rows",
+)
 
 billing_conn.close()
 
