@@ -19,7 +19,7 @@ import { LineChart } from '@/components/charts/LineChart'
 import { BarChart } from '@/components/charts/BarChart'
 import { PieChart } from '@/components/charts/PieChart'
 import { DB_CHART } from '@/lib/brand'
-import { LayoutDashboard, Zap, Server, ChevronDown, ChevronRight, Layers, Globe, RefreshCw, Users, Info, Tag, Boxes } from 'lucide-react'
+import { LayoutDashboard, Zap, Server, ChevronDown, ChevronRight, Layers, RefreshCw, Users, Info, Tag, Boxes } from 'lucide-react'
 
 /* ── helpers ──────────────────────────────────────────────────── */
 
