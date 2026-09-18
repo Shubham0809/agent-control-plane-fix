@@ -15,6 +15,7 @@ import {
 } from '@/api/hooks'
 import { usePersistedWorkspaceFilter } from '@/lib/usePersistedWorkspaceFilter'
 import { RefreshButton } from '@/components/RefreshButton'
+import { WorkspaceSelect } from '@/components/WorkspaceSelect'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { KpiCard } from '@/components/KpiCard'
@@ -197,18 +198,18 @@ export default function ObservabilityPage() {
         </div>
         <div className="flex items-center gap-3">
           {/* Workspace selector */}
-          <select
+          <WorkspaceSelect
             value={selectedWs ?? 'all'}
-            onChange={(e) => setSelectedWs(e.target.value || 'all')}
-            className="text-xs border border-gray-300 dark:border-gray-600 rounded-md px-2.5 py-1.5 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 focus:ring-1 focus:ring-red-500 focus:border-red-500"
-          >
-            <option value="all">All Workspaces</option>
-            {(obsWorkspaces || []).filter(ws => ws.trace_count > 0).map((ws) => (
-              <option key={ws.workspace_id} value={ws.workspace_id}>
-                Workspace {ws.workspace_id} ({ws.trace_count} traces)
-              </option>
-            ))}
-          </select>
+            onChange={(v) => setSelectedWs(v || 'all')}
+            options={(obsWorkspaces || [])
+              .filter((ws) => ws.trace_count > 0)
+              .map((ws) => ({
+                value: String(ws.workspace_id),
+                label: `Workspace ${ws.workspace_id} (${ws.trace_count} traces)`,
+              }))}
+            allValue="all"
+            className="text-xs border border-gray-300 dark:border-gray-600 rounded-md px-2.5 py-1.5 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300"
+          />
           <RefreshButton
             onRefresh={() => queryClient.invalidateQueries({ queryKey: ['mlflow'] })}
             isRefreshing={isFetchingMlflow}
