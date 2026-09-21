@@ -38,6 +38,16 @@ from pyspark.sql.types import (
 
 spark = SparkSession.builder.getOrCreate()
 
+
+class IncompleteBillingDownload(RuntimeError):
+    """Raised when a SQL result could not be fully downloaded (a chunk fetch/
+    download failed, or fewer rows arrived than the manifest promised).
+
+    Distinct from the generic SQL-failure RuntimeError so the per-query
+    `except` blocks that intentionally degrade on a *missing schema* can still
+    re-raise this one — a partial download must fail the task, never overwrite
+    Delta with a short/empty result."""
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -243,8 +253,10 @@ def _execute_sql(sql: str) -> List[Dict[str, Any]]:
                 except Exception as exc:
                     last_exc = exc
                     print(f"  ⚠️  {chunk_label} download failed (attempt {attempt + 1}/2): {exc}")
+                    if attempt == 0:
+                        time.sleep(1.5)  # brief backoff so a transient 429/stall can clear
             if last_exc is not None:
-                raise RuntimeError(f"{chunk_label} download failed: {last_exc}") from last_exc
+                raise IncompleteBillingDownload(f"{chunk_label} download failed: {last_exc}") from last_exc
 
     # Chunk 0's link is in the initial result. Re-use it.
     _download_chunk_links(resp.get("result") or {}, "chunk 0")
@@ -261,13 +273,15 @@ def _execute_sql(sql: str) -> List[Dict[str, Any]]:
             except Exception as exc:
                 last_exc = exc
                 print(f"  ⚠️  chunk {i} fetch failed (attempt {attempt + 1}/2): {exc}")
+                if attempt == 0:
+                    time.sleep(1.5)  # brief backoff so a transient 429/stall can clear
         if last_exc is not None:
-            raise RuntimeError(f"chunk {i} fetch failed: {last_exc}") from last_exc
+            raise IncompleteBillingDownload(f"chunk {i} fetch failed: {last_exc}") from last_exc
         _download_chunk_links(chunk, f"chunk {i}")
 
     print(f"  collected {len(rows)}/{total_rows} rows")
     if total_rows and len(rows) != total_rows:
-        raise RuntimeError(
+        raise IncompleteBillingDownload(
             f"Incomplete billing download: collected {len(rows)}/{total_rows} rows; "
             "refusing to overwrite Delta with a partial result"
         )
@@ -385,7 +399,12 @@ user_ep_rows = _execute_sql(f"""
         ON eu.served_entity_id = se.served_entity_id
     WHERE eu.request_time >= current_timestamp() - INTERVAL {RETENTION_DAYS} DAYS
       AND eu.workspace_id IS NOT NULL
-    GROUP BY DATE(eu.request_time), eu.workspace_id, se.endpoint_name, eu.requester
+    -- Group on the COALESCEd user_identity (not raw eu.requester) so a NULL and a
+    -- literal 'unknown' requester collapse into ONE row. Grouping on raw requester
+    -- emits two rows sharing the same (usage_date, workspace_id, endpoint_name,
+    -- user_identity) PK → the Lakebase ON CONFLICT upsert fails with "cannot affect
+    -- row a second time" (matches the pattern already used in queries 3/5/ext-spend).
+    GROUP BY DATE(eu.request_time), eu.workspace_id, se.endpoint_name, COALESCE(eu.requester, 'unknown')
 """)
 print(f"  ✅ {len(user_ep_rows)} user-endpoint rows")
 
@@ -435,6 +454,11 @@ try:
                  u.identity_metadata.run_by
     """)
     print(f"  ✅ {len(user_cost_rows)} actual per-user cost rows")
+except IncompleteBillingDownload:
+    # A partial/failed download must fail the task — never overwrite Delta with a
+    # short result (that's the whole point of the guard). Only genuine
+    # missing-schema SQL failures below are allowed to degrade.
+    raise
 except Exception as exc:
     # v2 attribution fields (usage_metadata.ai_gateway / identity_metadata.run_by)
     # may not exist on older system.billing.usage schemas — degrade gracefully.
@@ -592,6 +616,10 @@ try:
         HAVING ROUND(SUM(usage_quantity), 6) > 0
         ORDER BY total_cost_usd DESC
     """)
+except IncompleteBillingDownload:
+    # A partial/failed download must fail the task — never overwrite Delta with a
+    # short result. Only a genuine missing/unreadable table degrades below.
+    raise
 except Exception as exc:
     # Fail-open: the table is newish (AI Gateway external-model routing) and may
     # not exist / be readable on every account. Degrade to empty rather than fail

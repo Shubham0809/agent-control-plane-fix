@@ -2432,10 +2432,18 @@ def _sync_billing_full_refresh(conn, pg_table, delta_table, insert_sql, row_to_t
         delta_rows = spark.read.table(delta_table).collect()
         values = [row_to_tuple(r) for r in delta_rows]
         count = len(values)
+        if count == 0:
+            # A zero-row Delta read is almost always an upstream hiccup, not a real
+            # "usage went to zero" — and 09 now fails loud on failed/incomplete
+            # queries, so a partial result never reaches here. Preserve the last-good
+            # Lakebase table instead of TRUNCATE-ing it to empty, and do NOT stamp
+            # cache_meta fresh (which would hide the gap). Self-heals next non-empty run.
+            conn.rollback()
+            print(f"  ⚠️  {pg_table}: Delta read returned 0 rows — preserving last-good table (skipped truncate + cache stamp)")
+            return 0
         with conn.cursor() as cur:
             cur.execute(f"TRUNCATE TABLE {pg_table}")
-            if values:
-                execute_values(cur, insert_sql, values, page_size=500)
+            execute_values(cur, insert_sql, values, page_size=500)
         conn.commit()
     except Exception as exc:
         conn.rollback()
