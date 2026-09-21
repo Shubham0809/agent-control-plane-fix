@@ -353,8 +353,13 @@ for product_filter, label, days_back in [
                 ELSE 'compute'
             END AS workload_type,
             ROUND(SUM(u.usage_quantity), 4) AS total_dbus,
+            -- List price = COALESCE(effective_list.default, default) with NO
+            -- hardcoded fallback. This drops the fabricated $0.07/DBU that made
+            -- KB billing disagree with Cost Overview / budgets for the same SKU;
+            -- an unpriced SKU now yields NULL (excluded from cost) while
+            -- total_dbus still counts the usage. Matches 09/13.
             ROUND(SUM(u.usage_quantity *
-                COALESCE(lp.pricing.effective_list.default, lp.pricing.default, 0.07)
+                COALESCE(lp.pricing.effective_list.default, lp.pricing.default)
             ), 4) AS total_cost_usd
         FROM system.billing.usage u
         LEFT JOIN system.billing.list_prices lp
