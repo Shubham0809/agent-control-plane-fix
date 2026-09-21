@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { useQueryClient, useIsFetching } from '@tanstack/react-query'
 import { usePinnedAgents } from '@/lib/usePinnedAgents'
 import { usePersistedWorkspaceFilter } from '@/lib/usePersistedWorkspaceFilter'
+import { WorkspaceSelect } from '@/components/WorkspaceSelect'
 import {
   useAllAgentsMerged,
   useDiscoveryStatus,
@@ -337,19 +338,14 @@ function OverviewTab() {
             ))}
           </select>
           {/* Workspace filter */}
-          <select
+          <WorkspaceSelect
             value={workspaceId}
-            onChange={(e) => {
-              setWorkspaceId(e.target.value)
-              setPage(0)
-            }}
-            className="border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 text-sm bg-white dark:bg-gray-700 dark:text-gray-200 focus:ring-2 focus:ring-db-red/30 focus:border-db-red"
-          >
-            <option value={ALL_WORKSPACES}>All Workspaces</option>
-            {workspaces.map((ws) => (
-              <option key={ws} value={ws}>{ws}</option>
-            ))}
-          </select>
+            onChange={(v) => { setWorkspaceId(v); setPage(0) }}
+            options={workspaces.map((ws) => ({ value: String(ws), label: String(ws) }))}
+            allValue={ALL_WORKSPACES}
+            showIcon={false}
+            className="border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 text-sm bg-white dark:bg-gray-700 dark:text-gray-200"
+          />
           <RefreshButton
             onRefresh={() => syncAgents.mutate()}
             isPending={syncAgents.isPending}

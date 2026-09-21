@@ -20,6 +20,7 @@ import {
 } from '@/api/hooks'
 import { apiClient } from '@/api/client'
 import { RefreshButton } from '@/components/RefreshButton'
+import { WorkspaceSelect } from '@/components/WorkspaceSelect'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { KpiCard } from '@/components/KpiCard'
@@ -110,16 +111,16 @@ export default function VectorSearchPage() {
           </p>
         </div>
         <div className="flex items-center gap-3">
-          <select
+          <WorkspaceSelect
             value={selectedWs || ''}
-            onChange={(e) => setSelectedWs(e.target.value || null)}
-            className="text-xs border border-gray-300 dark:border-gray-600 rounded-md px-2.5 py-1.5 bg-white dark:bg-gray-800"
-          >
-            <option value="">All Workspaces</option>
-            {(overviewForFilter?.top_workspaces || []).slice(0, 20).map((ws: any) => (
-              <option key={ws.workspace_id} value={ws.workspace_id}>WS {String(ws.workspace_id).substring(0, 12)}...</option>
-            ))}
-          </select>
+            onChange={(v) => setSelectedWs(v || null)}
+            options={(overviewForFilter?.top_workspaces || []).map((ws: any) => ({
+              value: String(ws.workspace_id),
+              label: `WS ${ws.workspace_id}`,
+            }))}
+            allValue=""
+            className="text-xs border border-gray-300 dark:border-gray-600 rounded-md px-2.5 py-1.5 bg-white dark:bg-gray-800 dark:text-gray-200"
+          />
           <RefreshButton
             onRefresh={handleRefresh}
             isRefreshing={isFetching}

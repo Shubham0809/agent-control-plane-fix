@@ -9,6 +9,7 @@ import {
   type ExternalModelSpendRow,
 } from '@/api/hooks'
 import { usePersistedWorkspaceFilter } from '@/lib/usePersistedWorkspaceFilter'
+import { WorkspaceSelect, type WorkspaceOption } from '@/components/WorkspaceSelect'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { KpiCard } from '@/components/KpiCard'
@@ -18,7 +19,7 @@ import { LineChart } from '@/components/charts/LineChart'
 import { BarChart } from '@/components/charts/BarChart'
 import { PieChart } from '@/components/charts/PieChart'
 import { DB_CHART } from '@/lib/brand'
-import { LayoutDashboard, Zap, Server, ChevronDown, ChevronRight, Layers, Globe, RefreshCw, Users, Info, Tag, Boxes } from 'lucide-react'
+import { LayoutDashboard, Zap, Server, ChevronDown, ChevronRight, Layers, RefreshCw, Users, Info, Tag, Boxes } from 'lucide-react'
 
 /* ── helpers ──────────────────────────────────────────────────── */
 
@@ -76,24 +77,20 @@ function WorkspaceSelector({
   workspaces: BillingPageData['workspaces']
   isLoading: boolean
 }) {
+  const options: WorkspaceOption[] = (workspaces || []).map((ws) => ({
+    value: String(ws.workspace_id),
+    label:
+      `WS ${ws.workspace_id}` +
+      (Number(ws.endpoint_count) > 0 ? ` · ${ws.endpoint_count} endpoints` : ''),
+  }))
   return (
-    <div className="flex items-center gap-2">
-      <Globe className="w-4 h-4 text-gray-400 dark:text-gray-500" />
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        disabled={isLoading}
-        className="border rounded-lg px-3 py-2 text-sm min-w-[220px] dark:bg-gray-700 dark:border-gray-600 dark:text-gray-200"
-      >
-        <option value={ALL_WORKSPACES}>All Workspaces</option>
-        {(workspaces || []).map((ws) => (
-          <option key={ws.workspace_id} value={ws.workspace_id}>
-            WS {ws.workspace_id}
-            {Number(ws.endpoint_count) > 0 ? ` · ${ws.endpoint_count} endpoints` : ''}
-          </option>
-        ))}
-      </select>
-    </div>
+    <WorkspaceSelect
+      value={value}
+      onChange={onChange}
+      options={options}
+      allValue={ALL_WORKSPACES}
+      disabled={isLoading}
+    />
   )
 }
 
