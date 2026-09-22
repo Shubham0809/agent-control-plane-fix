@@ -214,7 +214,7 @@ export default function ObservabilityPage() {
             onRefresh={() => queryClient.invalidateQueries({ queryKey: ['mlflow'] })}
             isRefreshing={isFetchingMlflow}
             lastSynced={mlflowLastSynced}
-            title="Refresh MLflow data"
+            title="Updates the shared cache, not only the selected workspace"
           />
           {workspaceUrl && !selectedWs && (
             <a
